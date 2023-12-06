@@ -1,0 +1,254 @@
+# Rust builder
+FROM lukemathwalker/cargo-chef:latest-rust-1.70 AS chef
+WORKDIR /usr/src
+
+ARG CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
+
+FROM chef as planner
+COPY Cargo.toml Cargo.toml
+COPY rust-toolchain.toml rust-toolchain.toml
+COPY proto proto
+COPY router router
+COPY launcher launcher
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+
+ARG GIT_SHA
+ARG DOCKER_LABEL
+
+RUN PROTOC_ZIP=protoc-21.12-linux-x86_64.zip && \
+    curl -OL https://github.com/protocolbuffers/protobuf/releases/download/v21.12/$PROTOC_ZIP && \
+    unzip -o $PROTOC_ZIP -d /usr/local bin/protoc && \
+    unzip -o $PROTOC_ZIP -d /usr/local 'include/*' && \
+    rm -f $PROTOC_ZIP
+
+COPY --from=planner /usr/src/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
+
+COPY Cargo.toml Cargo.toml
+COPY rust-toolchain.toml rust-toolchain.toml
+COPY proto proto
+COPY router router
+COPY launcher launcher
+RUN cargo build --release
+
+# Python builder
+# Adapted from: https://github.com/pytorch/pytorch/blob/master/Dockerfile
+FROM debian:bullseye-slim as pytorch-install
+
+ARG PYTORCH_VERSION=2.0.0
+ARG PYTHON_VERSION=3.9
+ARG CUDA_VERSION=11.8
+ARG MAMBA_VERSION=23.1.0-1
+ARG CUDA_CHANNEL=nvidia
+ARG INSTALL_CHANNEL=pytorch
+# Automatically set by buildx
+ARG TARGETPLATFORM
+
+ENV PATH /opt/conda/bin:$PATH
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    ccache \
+    sudo \
+    curl \
+    git && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install conda
+# translating Docker's TARGETPLATFORM into mamba arches
+RUN case ${TARGETPLATFORM} in \
+    "linux/arm64")  MAMBA_ARCH=aarch64  ;; \
+    *)              MAMBA_ARCH=x86_64   ;; \
+    esac && \
+    curl -fsSL -v -o ~/mambaforge.sh -O  "https://github.com/conda-forge/miniforge/releases/download/${MAMBA_VERSION}/Mambaforge-${MAMBA_VERSION}-Linux-${MAMBA_ARCH}.sh"
+RUN chmod +x ~/mambaforge.sh && \
+    bash ~/mambaforge.sh -b -p /opt/conda && \
+    rm ~/mambaforge.sh
+
+# Install pytorch
+# On arm64 we exit with an error code
+RUN case ${TARGETPLATFORM} in \
+    "linux/arm64")  exit 1 ;; \
+    *)              /opt/conda/bin/conda update -y conda &&  \
+    /opt/conda/bin/conda install -y "python=3.9" && \
+    /opt/conda/bin/pip install torch==2.0.0+cu118 torchvision==0.15.1+cu118 torchaudio==2.0.1 --index-url https://download.pytorch.org/whl/cu118 ;; \
+    esac && \
+    /opt/conda/bin/conda clean -ya
+
+# CUDA kernels builder image
+FROM pytorch-install as kernel-builder
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN /opt/conda/bin/conda install -c "nvidia/label/cuda-11.8.0"  cuda==11.8 && \
+    /opt/conda/bin/conda clean -ya
+
+# Build Flash Attention CUDA kernels
+FROM kernel-builder as flash-att-builder
+
+WORKDIR /usr/src
+
+COPY server/Makefile-flash-att Makefile
+
+# Build specific version of flash attention
+RUN make build-flash-attention
+
+# Build Flash Attention v2 CUDA kernels
+FROM kernel-builder as flash-att-v2-builder
+
+WORKDIR /usr/src
+
+COPY server/Makefile-flash-att-v2 Makefile
+
+# Build specific version of flash attention v2
+RUN make build-flash-attention-v2
+
+# Build Transformers exllama and exllamav2 kernels
+FROM kernel-builder as exllama-kernels-builder
+
+WORKDIR /usr/src
+
+COPY server/exllamav2_kernels/ .
+
+# Build specific version of transformers
+RUN TORCH_CUDA_ARCH_LIST="8.0;8.6+PTX" python setup.py build
+
+# Build Transformers CUDA kernels
+FROM kernel-builder as custom-kernels-builder
+
+WORKDIR /usr/src
+
+COPY server/custom_kernels/ .
+
+# Build specific version of transformers
+RUN python setup.py build
+
+# Build vllm CUDA kernels
+FROM kernel-builder as vllm-builder
+
+RUN /opt/conda/bin/conda install packaging
+
+WORKDIR /usr/src
+
+COPY server/Makefile-vllm Makefile
+
+# Build specific version of vllm
+RUN make build-vllm
+
+# Build punica CUDA kernels
+FROM kernel-builder as punica-builder
+
+WORKDIR /usr/src
+
+COPY server/punica_kernels/ .
+
+# Build specific version of punica
+ENV TORCH_CUDA_ARCH_LIST="8.0;8.6+PTX"
+RUN python setup.py build
+
+# LoRAX base image
+FROM runpod/base:0.4.0-cuda11.8.0 as base
+
+# Conda env
+ENV PATH=/opt/conda/bin:$PATH \
+    CONDA_PREFIX=/opt/conda
+
+# LoRAX base env
+ENV HUGGINGFACE_HUB_CACHE=/data \
+    HF_HUB_ENABLE_HF_TRANSFER=1 \
+    PORT=8080
+
+WORKDIR /usr/src
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    libssl-dev \
+    ca-certificates \
+    make \
+    sudo \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy conda with PyTorch installed
+COPY --from=pytorch-install /opt/conda /opt/conda
+
+# Copy build artifacts from flash attention builder
+COPY --from=flash-att-builder /usr/src/flash-attention/build/lib.linux-x86_64-cpython-39 /opt/conda/lib/python3.9/site-packages
+COPY --from=flash-att-builder /usr/src/flash-attention/csrc/layer_norm/build/lib.linux-x86_64-cpython-39 /opt/conda/lib/python3.9/site-packages
+COPY --from=flash-att-builder /usr/src/flash-attention/csrc/rotary/build/lib.linux-x86_64-cpython-39 /opt/conda/lib/python3.9/site-packages
+
+# Copy build artifacts from flash attention v2 builder
+COPY --from=flash-att-v2-builder /usr/src/flash-attention-v2/build/lib.linux-x86_64-cpython-39 /opt/conda/lib/python3.9/site-packages
+
+# Copy build artifacts from custom kernels builder
+COPY --from=custom-kernels-builder /usr/src/build/lib.linux-x86_64-cpython-39 /opt/conda/lib/python3.9/site-packages
+# Copy build artifacts from exllama kernels builder
+COPY --from=exllama-kernels-builder /usr/src/build/lib.linux-x86_64-cpython-39 /opt/conda/lib/python3.9/site-packages
+
+# Copy builds artifacts from vllm builder
+COPY --from=vllm-builder /usr/src/vllm/build/lib.linux-x86_64-cpython-39 /opt/conda/lib/python3.9/site-packages
+
+# Copy builds artifacts from punica builder
+COPY --from=punica-builder /usr/src/build/lib.linux-x86_64-cpython-39 /opt/conda/lib/python3.9/site-packages
+
+# Install flash-attention dependencies
+RUN pip install einops --no-cache-dir
+
+# Install the pip requirements 
+COPY server/requirements.txt .
+RUN pip install -r requirements.txt
+
+# Install server
+COPY proto proto
+COPY server server
+COPY server/Makefile server/Makefile
+
+RUN cd server && \
+    make gen-server && \
+    pip install ".[bnb, accelerate, quantize]" --no-cache-dir
+
+# Install router
+COPY --from=builder /usr/src/target/release/lorax-router /usr/local/bin/lorax-router
+# Install launcher
+COPY --from=builder /usr/src/target/release/lorax-launcher /usr/local/bin/lorax-launcher
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    build-essential \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+
+# Final image
+FROM base
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends sudo curl unzip parallel time
+
+COPY container-entrypoint.sh entrypoint.sh
+RUN chmod +x entrypoint.sh
+COPY sync.sh sync.sh
+RUN chmod +x sync.sh
+
+
+RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" && \
+    unzip awscliv2.zip && \
+    sudo ./aws/install
+
+# ENTRYPOINT ["./entrypoint.sh"]
+# ENTRYPOINT ["lorax-launcher"]
+# CMD ["--json-output"]
+COPY builder/requirements.txt /requirements.txt
+RUN python -m pip install --upgrade pip && \
+    python -m pip install --upgrade -r /requirements.txt --no-cache-dir && \
+    rm /requirements.txt
+
+# NOTE: The base image comes with multiple Python versions pre-installed.
+#       It is reccommended to specify the version of Python when running your code.
+
+
+# Add src files (Worker Template)
+ADD src .
+
+CMD python -u /handler.py
